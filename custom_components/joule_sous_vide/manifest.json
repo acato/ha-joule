@@ -1,0 +1,9 @@
+{
+  "domain": "joule_sous_vide",
+  "name": "ChefSteps Joule Sous Vide",
+  "version": "0.2",
+  "documentation": "https://example.com",
+  "dependencies": [],
+  "codeowners": [ "@catomaior" ],
+  "requirements": [ "requests" ]
+}
