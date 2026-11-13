@@ -462,19 +462,23 @@ class JouleBLEAPI:
     async def write_message(self, payload: bytes) -> None:
         """Write a protobuf-encoded message to the device (write-with-response)."""
         _LOGGER.warning(
-            "BLE WRITE to %s (%d bytes): %s", WRITE_CHAR_UUID, len(payload), payload.hex()
+            "BLE WRITE to %s (%d bytes): %s", WRITE_CHAR_UUID, len(payload), "[redacted]"
         )
         try:
             await self._client.write_gatt_char(
                 WRITE_CHAR_UUID, bytearray(payload), response=True
             )
         except BleakError as err:
-            raise JouleBLEError("Failed to write message to Joule") from err
+            # Preserve the ATT status without exposing the payload or key.
+            code = err.args[0] if err.args and isinstance(err.args[0], int) else None
+            raise JouleBLEError(
+                f"Failed to write message to Joule (ATT status={code!s})"
+            ) from err
 
     async def write_message_no_response(self, payload: bytes) -> None:
         """Write a protobuf-encoded message to 4322 with response=False."""
         _LOGGER.warning(
-            "BLE WRITE-NR to %s (%d bytes): %s", WRITE_CHAR_UUID, len(payload), payload.hex()
+            "BLE WRITE-NR to %s (%d bytes): %s", WRITE_CHAR_UUID, len(payload), "[redacted]"
         )
         try:
             await self._client.write_gatt_char(
@@ -487,7 +491,7 @@ class JouleBLEAPI:
         """Write a message to the FILE characteristic (4326) using write-without-response."""
         _LOGGER.warning(
             "BLE WRITE-WOR to %s (%d bytes): %s",
-            FILE_CHAR_UUID, len(payload), payload.hex(),
+            FILE_CHAR_UUID, len(payload), "[redacted]",
         )
         try:
             await self._client.write_gatt_char(
@@ -504,7 +508,7 @@ class JouleBLEAPI:
                 "BLE READ from %s: %d bytes, raw=%s",
                 char_uuid,
                 len(data),
-                data.hex(),
+                "[redacted]",
             )
             return bytes(data)
         except BleakError as err:

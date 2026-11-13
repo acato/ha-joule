@@ -235,7 +235,7 @@ class StartKeyExchangeReply:
     """Device response with secret key for BLE auth."""
 
     secret_key: bytes = b""  # field 1, bytes
-    result: int = 0  # field 2, enum Result
+    result: int | None = None  # field 2, enum Result; must be present
 
 
 @dataclass
@@ -249,7 +249,7 @@ class SubmitKeyRequest:
 class SubmitKeyReply:
     """Device response to key submission."""
 
-    result: int = 0  # field 1, enum Result
+    result: int | None = None  # field 1, enum Result
 
 
 @dataclass
