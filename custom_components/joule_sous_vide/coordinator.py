@@ -79,6 +79,10 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._latest_data_point: CirculatorDataPoint | None = None
         self._notification_received: asyncio.Event = asyncio.Event()
+        self._key_exchange_received = asyncio.Event()
+        self._submit_key_received = asyncio.Event()
+        self._pending_auth_reply: asyncio.Event | None = None
+        self._auth_poll_baseline: bytes | None = None
         self._subscribed: bool = False
         self._authenticated: bool = False
         self._start_program_reply_received: bool = False
@@ -125,7 +129,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.warning(
             "NOTIFICATION on 4325: %d bytes, raw=%s",
             len(data),
-            data.hex() if data else "(empty)",
+            "[redacted]" if data else "(empty)",
         )
         # Schedule a read from 4323 (the real data source)
         self.hass.async_create_task(self._read_and_process())
@@ -140,7 +144,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if read_data and len(read_data) > 0:
                 _LOGGER.warning(
                     "READ from 4323 (triggered by notification): %d bytes: %s",
-                    len(read_data), read_data.hex(),
+                    len(read_data), "[redacted]",
                 )
                 self._try_decode_message(read_data, source="4323-read")
             else:
@@ -154,23 +158,34 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _try_decode_message(self, data: bytes, source: str) -> None:
         """Decode a protobuf StreamMessage and update internal state."""
+        if "poll" in source and data == self._auth_poll_baseline:
+            return
         try:
             msg = decode_stream_message(data)
             if msg.start_key_exchange_reply is not None:
+                if self._pending_auth_reply is not self._key_exchange_received:
+                    return
                 key = msg.start_key_exchange_reply.secret_key
                 _LOGGER.warning(
-                    "Got StartKeyExchangeReply from %s! key=%s result=%d",
-                    source, key.hex(), msg.start_key_exchange_reply.result,
+                    "Got StartKeyExchangeReply from %s! key=%s result=%s",
+                    source, "[redacted]", msg.start_key_exchange_reply.result,
                 )
-                self._auth_key = key
-                self._persist_auth_key(key)
+                if msg.start_key_exchange_reply.result == 0 and key:
+                    self._auth_key = key
+                    self._persist_auth_key(key)
+                else:
+                    self._auth_key = None
+                self._key_exchange_received.set()
                 self._notification_received.set()
             elif msg.submit_key_reply is not None:
+                if self._pending_auth_reply is not self._submit_key_received:
+                    return
                 _LOGGER.warning(
-                    "Got SubmitKeyReply from %s! result=%d",
+                    "Got SubmitKeyReply from %s! result=%s",
                     source, msg.submit_key_reply.result,
                 )
-                self._authenticated = True
+                self._authenticated = msg.submit_key_reply.result == 0
+                self._submit_key_received.set()
                 self._notification_received.set()
             elif msg.start_program_reply is not None:
                 result = msg.start_program_reply.result
@@ -219,11 +234,11 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self._notification_received.set()
         except Exception:  # noqa: BLE001
-            _LOGGER.warning("Failed to decode message from %s: %s", source, data.hex())
+            _LOGGER.warning("Failed to decode message from %s: %s", source, "[redacted]")
 
     def _persist_auth_key(self, key: bytes) -> None:
         """Save the BLE auth key to config entry options for future connections."""
-        _LOGGER.warning("Persisting BLE auth key: %s", key.hex())
+        _LOGGER.debug("Persisting BLE auth key")
         self.hass.config_entries.async_update_entry(
             self._entry,
             options={**self._entry.options, CONF_BLE_AUTH_KEY: key.hex()},
@@ -248,7 +263,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _try_write_and_wait(
         self, label: str, payload: bytes, timeout: float,
-        *, no_response: bool = False,
+        *, no_response: bool = False, reply_event: asyncio.Event | None = None,
     ) -> bool:
         """Write a payload to 4322 and wait for data.
 
@@ -258,73 +273,85 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         (triggers a read from 4323).  Polls 4323 every 5 seconds as keepalive.
         Returns True on response.
         """
-        _LOGGER.warning(
-            "%s (%d bytes): %s", label, len(payload), payload.hex(),
-        )
-        self._notification_received.clear()
-
         try:
-            async with asyncio.timeout(10):
-                if no_response:
-                    await self.api.write_message_no_response(payload)
-                else:
-                    await self.api.write_message(payload)
-            _LOGGER.warning("Write succeeded for %s", label)
-        except TimeoutError:
-            _LOGGER.warning("Write timed out for %s", label)
-            return False
-        except JouleBLEError as err:
-            _LOGGER.warning("Write failed for %s: %s", label, err)
-            return False
-
-        # Poll: wait for notification OR check 4323+4325 periodically.
-        # Use faster polling when connected via proxy (notifications unreliable).
-        elapsed = 0.0
-        poll_interval = (
-            PROXY_POLL_INTERVAL
-            if self.api.is_connected_via_proxy
-            else 5.0
-        )
-        while elapsed < timeout:
-            wait_time = min(poll_interval, timeout - elapsed)
-            try:
-                async with asyncio.timeout(wait_time):
-                    await self._notification_received.wait()
-                _LOGGER.warning("Got response after %s!", label)
-                return True
-            except TimeoutError:
-                elapsed += wait_time
-
-            # Read BOTH 4323 and 4325 — response could be on either
-            for char_uuid, char_name in [
-                (READ_CHAR_UUID, "4323"),
-                (SUBSCRIBE_CHAR_UUID, "4325"),
-            ]:
-                read_data = await self.api.read_characteristic(char_uuid)
-                if read_data and len(read_data) > 0:
-                    _LOGGER.warning(
-                        "Poll %s after %s: %d bytes: %s",
-                        char_name, label, len(read_data), read_data.hex(),
-                    )
-                    self._try_decode_message(
-                        read_data, source=f"{char_name}-poll-{label}",
-                    )
-                    if self._notification_received.is_set():
-                        return True
-
             _LOGGER.warning(
-                "Poll after %s at %.0fs: both empty", label, elapsed,
+                "%s (%d bytes): %s", label, len(payload), "[redacted]",
             )
+            response_event = reply_event if reply_event is not None else self._notification_received
+            response_event.clear()
+            if reply_event is not None:
+                # A characteristic can retain an older reply. Snapshot it before
+                # writing; blind polls must not treat unchanged bytes as a reply.
+                async with asyncio.timeout(10):
+                    self._auth_poll_baseline = await self.api.read_characteristic(READ_CHAR_UUID)
+                self._pending_auth_reply = reply_event
 
-        _LOGGER.warning("No response to %s after %.0fs", label, timeout)
-        return False
+            try:
+                async with asyncio.timeout(10):
+                    if no_response:
+                        await self.api.write_message_no_response(payload)
+                    else:
+                        await self.api.write_message(payload)
+                _LOGGER.warning("Write succeeded for %s", label)
+            except TimeoutError:
+                _LOGGER.warning("Write timed out for %s", label)
+                return False
+            except JouleBLEError as err:
+                _LOGGER.warning("Write failed for %s: %s", label, err)
+                return False
+
+            # Poll: wait for notification OR check 4323+4325 periodically.
+            # Use faster polling when connected via proxy (notifications unreliable).
+            elapsed = 0.0
+            poll_interval = (
+                PROXY_POLL_INTERVAL
+                if self.api.is_connected_via_proxy
+                else 5.0
+            )
+            while elapsed < timeout:
+                wait_time = min(poll_interval, timeout - elapsed)
+                try:
+                    async with asyncio.timeout(wait_time):
+                        await response_event.wait()
+                    _LOGGER.warning("Got response after %s!", label)
+                    return True
+                except TimeoutError:
+                    elapsed += wait_time
+
+                # Read BOTH 4323 and 4325 — response could be on either
+                for char_uuid, char_name in [
+                    (READ_CHAR_UUID, "4323"),
+                    (SUBSCRIBE_CHAR_UUID, "4325"),
+                ]:
+                    read_data = await self.api.read_characteristic(char_uuid)
+                    if read_data and len(read_data) > 0:
+                        _LOGGER.warning(
+                            "Poll %s after %s: %d bytes: %s",
+                            char_name, label, len(read_data), "[redacted]",
+                        )
+                        self._try_decode_message(
+                            read_data, source=f"{char_name}-poll-{label}",
+                        )
+                        if response_event.is_set():
+                            return True
+
+                _LOGGER.warning(
+                    "Poll after %s at %.0fs: both empty", label, elapsed,
+                )
+
+            _LOGGER.warning("No response to %s after %.0fs", label, timeout)
+            return False
+        finally:
+            if reply_event is not None:
+                self._pending_auth_reply = None
+                self._auth_poll_baseline = None
 
     async def _read_and_log(self, char_uuid: str, label: str) -> bytes | None:
         """Read a characteristic and log the result. Returns raw bytes."""
         data = await self.api.read_characteristic(char_uuid)
         if data and len(data) > 0:
             _LOGGER.warning(
-                "%s: %d bytes: %s", label, len(data), data.hex(),
+                "%s: %d bytes: %s", label, len(data), "[redacted]",
             )
         else:
             _LOGGER.warning("%s: empty", label)
@@ -366,7 +393,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._last_polled_data = data
                     _LOGGER.warning(
                         "Proxy poll: new data from 4323: %d bytes: %s",
-                        len(data), data.hex(),
+                        len(data), "[redacted]",
                     )
                     self._try_decode_message(data, source="4323-proxy-poll")
             except Exception:  # noqa: BLE001
@@ -382,126 +409,53 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await super().async_shutdown()
 
     async def _key_exchange(self) -> bool:
-        """Perform application-level key exchange with the Joule.
+        """Send one compact request and wait for physical button confirmation.
 
-        The Joule uses its own key exchange (NOT OS-level BLE pairing).
-        The user must press the button on top of the Joule within 60 seconds.
-
-        v0.9.9 revealed that compact messages missing proto2 `required` fields
-        (senderAddress, recipientAddress) are silently rejected by the Joule's
-        nanopb parser.  This version uses encode_stream_message() which always
-        includes those fields — even when empty — satisfying proto2 validation.
-
-        Message variants (all include required fields 5 and 6):
-        - empty addrs (14B): fits in 20-byte ATT payload at MTU=23
-        - empty sender + 6-byte MAC recipient (20B): fits exactly
-        - full 8-byte addrs (34B): via Long Write (response=True)
+        Keep one exchange pending until its reply arrives. Use empty addresses
+        and one write with response, as in the Joule Remote client, then wait
+        for the key-exchange reply rather than an unrelated notification.
         """
         from homeassistant.components.persistent_notification import (
             async_create,
             async_dismiss,
         )
-        from .joule_ble import mac_to_bytes
-        from .joule_proto import (
-            StreamMessage,
-            StartKeyExchangeRequest,
-            encode_stream_message,
-        )
 
-        mtu_payload = self.api.mtu_size - 3 if self.api.mtu_size > 3 else 20
-        _LOGGER.warning("Effective ATT payload: %d bytes", mtu_payload)
-
+        self._auth_key = None
+        self._authenticated = False
         async_create(
             self.hass,
-            "**Press the button on top of your Joule** to complete pairing.\n\n"
-            "You have 60 seconds.",
+            "**Press the button on top of your Joule now** to complete pairing.\n\n"
+            "Keep Joule nearby and disconnect other apps before pairing.",
             title="Joule Pairing Required",
             notification_id="joule_sous_vide_pairing",
         )
-
         try:
-            mac_6 = mac_to_bytes(self.api.mac_address)
-
-            # --- Variant A: empty addresses (12 bytes) ---
-            # All required fields present; addresses are zero-length bytes.
-            # Session handle + no end field (matches iOS app capture).
-            msg_empty = StreamMessage(
-                handle=self._new_handle(),
-                sender_address=b"",
-                recipient_address=b"",
-                start_key_exchange_request=StartKeyExchangeRequest(),
-            )
-            payload_empty = encode_stream_message(msg_empty)
-            _LOGGER.warning(
-                "KE-empty-addrs (%d bytes): %s",
-                len(payload_empty), payload_empty.hex(),
-            )
-            await self._safe_write("KE-empty-WR", payload_empty, response=True)
-            await self._safe_write("KE-empty-WC", payload_empty, response=False)
-
-            # --- Variant B: empty sender + 6-byte MAC recipient ---
-            msg_mac6 = StreamMessage(
-                handle=self._new_handle(),
-                sender_address=b"",
-                recipient_address=mac_6,
-                start_key_exchange_request=StartKeyExchangeRequest(),
-            )
-            payload_mac6 = encode_stream_message(msg_mac6)
-            _LOGGER.warning(
-                "KE-mac6 (%d bytes): %s",
-                len(payload_mac6), payload_mac6.hex(),
-            )
-            await self._safe_write("KE-mac6-WR", payload_mac6, response=True)
-
-            # --- Variant C: full format with 8-byte padded addresses ---
-            full_payload = build_start_key_exchange_message(
-                sender=self.api.sender_address,
-                recipient=self.api.recipient_address,
-                handle=self._new_handle(),
-            )
-            _LOGGER.warning(
-                "KE-full (%d bytes, MTU payload=%d): %s",
-                len(full_payload), mtu_payload, full_payload.hex(),
-            )
-            await self._safe_write(
-                "KE-full-longwrite", full_payload, response=True,
-            )
-
-            # --- Wait for any response ---
-            _LOGGER.warning(
-                "All KE variants sent — waiting %.0fs for response "
-                "(PRESS JOULE BUTTON NOW!)",
-                self.KEY_EXCHANGE_TIMEOUT,
+            payload = build_start_key_exchange_message(
+                sender=b"", recipient=b"", handle=self._new_handle(),
             )
             got_reply = await self._try_write_and_wait(
-                "KE-wait",
-                payload_empty,
-                self.KEY_EXCHANGE_TIMEOUT,
+                "StartKeyExchange", payload, self.KEY_EXCHANGE_TIMEOUT,
+                reply_event=self._key_exchange_received,
             )
-
-            if got_reply and self._auth_key is not None:
-                _LOGGER.warning("Got secret key! Submitting...")
+            if got_reply and self._auth_key:
                 return await self._submit_key(self._auth_key)
-
-            _LOGGER.warning(
-                "Key exchange timed out — no variant got a response"
-            )
+            _LOGGER.warning("Key exchange failed or timed out")
             return False
-
         finally:
             async_dismiss(self.hass, "joule_sous_vide_pairing")
 
     async def _submit_key(self, key: bytes) -> bool:
         """Submit a secret key to authenticate with the Joule.
 
-        Tries empty addresses first (matching the iOS app capture), then
-        falls back to full addresses if no response.
+        Uses empty addresses, matching the working Joule Remote client.
+        A rejection or timeout ends this attempt without speculative writes.
 
         Returns True if the device accepted the key.
         """
-        _LOGGER.warning("Submitting auth key: %s", key.hex())
+        _LOGGER.debug("Submitting stored BLE auth key")
+        self._authenticated = False
 
-        # Variant 1: empty addresses (matches iOS app exactly — 26 bytes)
+        # Empty addresses; encoded length depends on the key length.
         payload_empty = build_submit_key_message(
             secret_key=key,
             sender=b"",
@@ -510,26 +464,13 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         got_reply = await self._try_write_and_wait(
             "SubmitKey-empty-addrs", payload_empty, self.NOTIFICATION_TIMEOUT,
+            reply_event=self._submit_key_received,
         )
         if got_reply and self._authenticated:
             _LOGGER.warning("Authentication successful (empty addrs)!")
             return True
 
-        # Variant 2: full addresses (original behavior — 42 bytes, Long Write)
-        payload_full = build_submit_key_message(
-            secret_key=key,
-            sender=self.api.sender_address,
-            recipient=self.api.recipient_address,
-            handle=self._new_handle(),
-        )
-        got_reply = await self._try_write_and_wait(
-            "SubmitKey-full-addrs", payload_full, self.NOTIFICATION_TIMEOUT,
-        )
-        if got_reply and self._authenticated:
-            _LOGGER.warning("Authentication successful (full addrs)!")
-            return True
-
-        _LOGGER.warning("SubmitKeyRequest failed — no variant got a response")
+        _LOGGER.warning("SubmitKeyRequest failed or was rejected")
         return False
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -599,7 +540,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 stale = await self.api.read_characteristic(READ_CHAR_UUID)
                 _LOGGER.warning(
                     "Initial 4323 read (clear buffer): %s",
-                    stale.hex() if stale else "empty",
+                    "[redacted]" if stale else "empty",
                 )
 
                 # Start proxy poller if connected via proxy (notifications
@@ -644,7 +585,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except JouleBLEError as err:
             raise UpdateFailed(f"BLE communication failed: {err}") from err
 
-        current_temperature: float = 0.0
+        current_temperature: float | None = None
         if self._latest_data_point is not None:
             current_temperature = self._latest_data_point.bath_temp
 
@@ -848,7 +789,7 @@ class JouleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         A full _async_update_data() poll would read stale CirculatorDataPoint
         data (still step=UNKNOWN) and override the is_cooking flag.
         """
-        current_temp = 0.0
+        current_temp = None
         if self._latest_data_point is not None:
             current_temp = self._latest_data_point.bath_temp
         self.async_set_updated_data({

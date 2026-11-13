@@ -41,18 +41,18 @@ async def test_update_data_returns_expected_shape(
     assert "temperature_unit" in coordinator.data
 
 
-async def test_update_data_returns_zero_temperature_placeholder(
+async def test_update_data_returns_unknown_temperature_before_telemetry(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     mock_ble_api: MagicMock,
 ) -> None:
-    """current_temperature is 0.0 (placeholder until protobuf is implemented)."""
+    """Temperature must stay unknown until the device supplies telemetry."""
     coordinator: JouleCoordinator = hass.data[DOMAIN][setup_integration.entry_id]
 
     await coordinator.async_refresh()
     await hass.async_block_till_done()
 
-    assert coordinator.data["current_temperature"] == 0.0
+    assert coordinator.data["current_temperature"] is None
 
 
 async def test_update_data_raises_update_failed_on_connect_error_during_poll(

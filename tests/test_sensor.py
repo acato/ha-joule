@@ -2,7 +2,7 @@
 from unittest.mock import MagicMock
 
 import pytest
-from homeassistant.const import STATE_UNAVAILABLE, UnitOfTemperature
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -73,12 +73,12 @@ async def test_sensor_device_info(
 # ---------------------------------------------------------------------------
 
 
-async def test_sensor_state_returns_placeholder_temperature(
+async def test_sensor_state_is_unknown_before_telemetry(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     mock_ble_api: MagicMock,
 ) -> None:
-    """Sensor state returns 0.0 (placeholder until protobuf is implemented)."""
+    """Do not invent a zero reading before the device sends telemetry."""
     from custom_components.joule_sous_vide.const import DOMAIN
     from custom_components.joule_sous_vide.coordinator import JouleCoordinator
 
@@ -91,7 +91,7 @@ async def test_sensor_state_returns_placeholder_temperature(
     state = hass.states.get(entity_id)
 
     assert state is not None
-    assert float(state.state) == pytest.approx(0.0)
+    assert state.state == STATE_UNKNOWN
 
 
 async def test_sensor_unit_of_measurement(
@@ -148,4 +148,30 @@ async def test_sensor_recovers_after_ble_failure(
     await coordinator.async_refresh()
     await hass.async_block_till_done()
 
-    assert float(hass.states.get(entity_id).state) == pytest.approx(0.0)
+    assert hass.states.get(entity_id).state == STATE_UNKNOWN
+
+
+@pytest.mark.parametrize("temperature", [0.0, 23.5])
+async def test_sensor_reports_real_temperature_including_zero(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_ble_api: MagicMock,
+    temperature: float,
+) -> None:
+    """An actual zero reading is valid; only missing telemetry is unknown."""
+    from custom_components.joule_sous_vide.joule_proto import (
+        FIELD_CIRCULATOR_DATA_POINT, encode_field_bytes, encode_field_float,
+    )
+
+    coordinator = hass.data[DOMAIN][setup_integration.entry_id]
+    entity_id = _get_sensor_entity_id(hass)
+    assert hass.states.get(entity_id).state == STATE_UNKNOWN
+    coordinator._try_decode_message(
+        encode_field_bytes(
+            FIELD_CIRCULATOR_DATA_POINT, encode_field_float(10, temperature),
+        ),
+        source="4323-read",
+    )
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert float(hass.states.get(entity_id).state) == pytest.approx(temperature)

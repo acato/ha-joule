@@ -57,7 +57,7 @@ Once set up, Home Assistant creates five entities for your Joule, all under a si
 1. Go to **Settings** → **Devices & Services** → **+ Add Integration**.
 2. Search for **Joule** and select **ChefSteps Joule Sous Vide**.
 3. Enter your Joule's Bluetooth MAC address (`AA:BB:CC:DD:EE:FF`) and click **Submit**.
-4. **First-time only:** A notification will appear asking you to press the physical button on top of the Joule within 60 seconds. This completes the application-level key exchange. The key is saved automatically — subsequent connections won't require the button press.
+4. **First-time only:** A notification will appear asking you to press the physical button on top of the Joule promptly. This completes the application-level key exchange. The key is saved automatically — subsequent connections won't require the button press.
 
 > ✅ On success, a **"Joule AA:BB:CC:DD:EE:FF"** device appears with five entities ready to use.
 
@@ -112,7 +112,7 @@ action:
 | Limitation | Details |
 |---|---|
 | **BLE-only — no cloud** | This integration communicates exclusively over Bluetooth and requires no cloud connectivity. WiFi/cloud control is not supported. |
-| **First-time auth requires button press** | The Joule uses application-level key exchange, not OS-level BLE pairing. On first setup, the user must press the physical button on the Joule within 60 seconds. The key is persisted and reused automatically on reconnection. |
+| **First-time auth requires button press** | The Joule uses application-level key exchange, not OS-level BLE pairing. On first setup, the user must press the physical button on the Joule promptly when notified. The key is persisted and reused automatically on reconnection. |
 | **BLE protocol** | The integration uses an independent BLE protocol implementation. Commands may not work on all firmware versions. |
 | **State polling delay** | Cooking state is read from the device every 30 seconds via `program_step`. Between polls, state may be stale if the Joule is controlled from the ChefSteps app. |
 | **One connection at a time** | Bluetooth only supports one active connection. Close the ChefSteps app before using this integration. |
